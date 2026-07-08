@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vlp_hackathon.baseline_model import BaselineMLP
+from vlp_hackathon.baseline_model import build_mlp
 from vlp_hackathon.dataset import CONF2_3X3_LED_INDICES
 from vlp_hackathon.export import tflite_to_c_array
 

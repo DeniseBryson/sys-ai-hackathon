@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vlp_hackathon.baseline_model import BaselineMLP
+from vlp_hackathon.baseline_model import build_mlp
 from vlp_hackathon.export import tflite_to_c_array
 
 
@@ -25,13 +25,19 @@ def c_float(value: float) -> str:
 
 
 def main() -> None:
-    state_path = ROOT / "models" / "baseline_task1.pt"
-    scaling_path = ROOT / "models" / "baseline_task1_scaling.npz"
-    out_path = ROOT / "models" / "baseline_task1.tflite"
+    state_path = ROOT / "models" / "ourmlp_task1.pt"
+    scaling_path = ROOT / "models" / "ourmlp_task1_scaling.npz"
+    out_path = ROOT / "models" / "ourmlp_task1.tflite"
     firmware_dir = ROOT / "firmware" / "vlp_serial"
     firmware_path = firmware_dir / "vlp_model.tflite"
 
-    model = BaselineMLP(9)
+    scaling = np.load(scaling_path)
+    rss_scale = float(scaling["rss_scale"])
+    target_min_cm = np.asarray(scaling["target_min_cm"], dtype=np.float32)
+    target_range_cm = np.asarray(scaling["target_range_cm"], dtype=np.float32)
+    hidden_sizes = [int(h) for h in scaling["hidden_sizes"]]
+
+    model = build_mlp(9, hidden_sizes)
     model.load_state_dict(torch.load(state_path, map_location="cpu"))
     model.eval()
 
@@ -50,11 +56,6 @@ def main() -> None:
         firmware_dir / "model_data.cc",
         firmware_dir / "model_data.h",
     )
-
-    scaling = np.load(scaling_path)
-    rss_scale = float(scaling["rss_scale"])
-    target_min_cm = np.asarray(scaling["target_min_cm"], dtype=np.float32)
-    target_range_cm = np.asarray(scaling["target_range_cm"], dtype=np.float32)
 
     (firmware_dir / "preprocess_data.h").write_text(
         "#pragma once\n\n"
