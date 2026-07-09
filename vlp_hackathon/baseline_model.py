@@ -15,7 +15,7 @@ def build_mlp(input_features: int, hidden_sizes: list[int]) -> nn.Module:
     in_features = input_features
     for h in hidden_sizes:
         layers.append(nn.Linear(in_features, h))
-        layers.append(nn.ReLU())
+        layers.append(nn.ReLU6())
         in_features = h
     layers.append(nn.Linear(in_features, 2))
     layers.append(nn.Sigmoid())

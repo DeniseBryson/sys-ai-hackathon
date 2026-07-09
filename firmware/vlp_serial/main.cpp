@@ -180,7 +180,8 @@ void handle_predict(uint16_t n_features) {
       return;
     }
     const float rss = get_f32_le(raw);
-    const float normalized = rss / kRssScale;
+    const float shifted = std::max(rss + kRssMeanShift, 0.0f);
+    const float normalized = shifted / kRssScale;
     if (input->type == kTfLiteFloat32) {
       input->data.f[i] = normalized;
     } else {
