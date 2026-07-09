@@ -5,6 +5,7 @@
 #include "pico/stdio.h"
 #include "pico/stdlib.h"
 
+#include "aging_correction_data.h"
 #include "model_data.h"
 #include "preprocess_data.h"
 #include "target_scale_data.h"
@@ -34,6 +35,13 @@ const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
+
+// Persists across requests for the device's whole deployed life: a per-channel
+// peak-hold-with-slow-release estimate that counteracts LED aging drift without
+// needing to know the true installation age or any channel's decay rate. See
+// aging_correction_data.h and notebooks/aging_correction.py for how this was fit
+// and validated against vlp_hackathon/aging.py's simulated decay.
+float aging_peak_estimate[kAgingChannelCount];
 
 bool read_exact(uint8_t* dst, size_t count) {
   for (size_t i = 0; i < count; ++i) {
@@ -157,6 +165,10 @@ bool initialize_model() {
   if (output->dims == nullptr || output->dims->size < 1) {
     return false;
   }
+
+  for (int i = 0; i < kAgingChannelCount; ++i) {
+    aging_peak_estimate[i] = kAgingReferencePeak[i];
+  }
   return true;
 }
 
@@ -180,7 +192,18 @@ void handle_predict(uint16_t n_features) {
       return;
     }
     const float rss = get_f32_le(raw);
-    const float shifted = std::max(rss + kRssMeanShift, 0.0f);
+
+    float aging_corrected = rss;
+    if (i < kAgingChannelCount) {
+      float& peak_est = aging_peak_estimate[i];
+      peak_est = std::max(rss, peak_est * kAgingRelease);
+      const float aging_factor = std::min(
+          kAgingMaxFactor,
+          std::max(1.0f, kAgingReferencePeak[i] / std::max(peak_est, 1e-6f)));
+      aging_corrected = rss * aging_factor;
+    }
+
+    const float shifted = std::max(aging_corrected + kRssMeanShift, 0.0f);
     const float normalized = shifted / kRssScale;
     if (input->type == kTfLiteFloat32) {
       input->data.f[i] = normalized;
