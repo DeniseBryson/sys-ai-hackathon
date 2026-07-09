@@ -22,3 +22,4 @@ firmware/build/
 .DS_Store
 .vscode/
 .idea/
+/notebooks/__marimo__/session
