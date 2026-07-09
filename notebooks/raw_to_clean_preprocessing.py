@@ -20,18 +20,15 @@ def _():
 @app.cell
 def _(mo):
     mo.md(r"""
-    # Turning raw RSS samples into "clean-like" samples
+    # Mean/std correction for raw RSS samples
 
     `firmware/vlp_serial/main.cpp` only ever sees **one raw reading at a time** and has
     no ground-truth label, so any preprocessing candidate has to be a pure per-sample
     function `f(raw_row) -> processed_row` — no grouping across requests, no history.
 
-    Plain clipping to the training range turned out to do almost nothing: only ~1% of
-    raw values in the training set actually exceed `rss_scale`, so there's barely
-    anything to clip. This notebook instead compares the **marginal distribution** of
-    each raw channel against the corresponding clean channel, and tries transforms that
-    reshape raw samples to look more like clean ones — channel by channel, sample by
-    sample.
+    Raw samples run at a slightly different mean and std than clean samples. This
+    notebook fits and tests three ways to correct that: a single global mean shift, a
+    single global mean+std match, and a per-sample (instance) mean+std normalization.
     """)
     return
 
@@ -84,12 +81,72 @@ def _(DATA, load_csv, mo, np):
     return X_test_raw, X_train_clean, X_train_raw, y_test_cm
 
 
-app._unparsable_cell(
-    r"""
-    X_train_clean ´
-    """,
-    name="_"
-)
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Per-sample statistics: mean and std across channels
+
+    For each individual row, take the mean and std **across its 9 channels**. If raw
+    rows systematically run at a different "energy level" (mean) or "spread" (std) than
+    clean rows, a per-sample transform like `(row - row.mean()) / row.std() * target_std
+    + target_mean` (instance normalization, rescaled to clean's typical level) could
+    realign a raw fingerprint's *shape* even though it never sees another sample or a
+    label.
+    """)
+    return
+
+
+@app.cell
+def _(X_train_clean, X_train_raw):
+    clean_sample_mean = X_train_clean.mean(axis=1)
+    clean_sample_std = X_train_clean.std(axis=1)
+    raw_sample_mean = X_train_raw.mean(axis=1)
+    raw_sample_std = X_train_raw.std(axis=1)
+
+    print(
+        f"clean sample-mean: {clean_sample_mean.mean():.4f} +/- {clean_sample_mean.std():.4f}  "
+        f"(min {clean_sample_mean.min():.4f}, max {clean_sample_mean.max():.4f})"
+    )
+    print(
+        f"raw   sample-mean: {raw_sample_mean.mean():.4f} +/- {raw_sample_mean.std():.4f}  "
+        f"(min {raw_sample_mean.min():.4f}, max {raw_sample_mean.max():.4f})"
+    )
+    print(
+        f"clean sample-std:  {clean_sample_std.mean():.4f} +/- {clean_sample_std.std():.4f}  "
+        f"(min {clean_sample_std.min():.4f}, max {clean_sample_std.max():.4f})"
+    )
+    print(
+        f"raw   sample-std:  {raw_sample_std.mean():.4f} +/- {raw_sample_std.std():.4f}  "
+        f"(min {raw_sample_std.min():.4f}, max {raw_sample_std.max():.4f})"
+    )
+    return clean_sample_mean, clean_sample_std, raw_sample_mean, raw_sample_std
+
+
+@app.cell
+def _(
+    clean_sample_mean,
+    clean_sample_std,
+    plt,
+    raw_sample_mean,
+    raw_sample_std,
+):
+    fig_stats, (ax_mean, ax_std) = plt.subplots(1, 2, figsize=(11, 4))
+
+    ax_mean.hist(clean_sample_mean, bins=60, alpha=0.5, density=True, label="clean")
+    ax_mean.hist(raw_sample_mean, bins=60, alpha=0.5, density=True, label="raw")
+    ax_mean.set_xlabel("per-sample mean (across channels)")
+    ax_mean.set_ylabel("density")
+    ax_mean.set_title("Per-sample mean")
+    ax_mean.legend()
+
+    ax_std.hist(clean_sample_std, bins=60, alpha=0.5, density=True, label="clean")
+    ax_std.hist(raw_sample_std, bins=60, alpha=0.5, density=True, label="raw")
+    ax_std.set_xlabel("per-sample std (across channels)")
+    ax_std.set_title("Per-sample std")
+    ax_std.legend()
+
+    fig_stats
+    return
 
 
 @app.cell
@@ -113,7 +170,91 @@ def _(MODELS, np):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Per-channel distribution: clean vs. raw
+    ## Candidate mean/std corrections
+
+    Each transform below is a pure function of a single raw row — nothing here looks
+    at neighboring samples or labels, so all of them are directly portable to the
+    firmware's `handle_predict` loop.
+    """)
+    return
+
+
+@app.cell
+def _(np):
+    def fit_mean_shift(raw_ref, clean_ref):
+        # A single scalar added to every channel of every sample, so the raw set's
+        # overall (global) mean lands on the clean set's overall mean -- no per-channel
+        # or per-sample fitting, just one number.
+        return float(clean_ref.mean() - raw_ref.mean())
+
+    def apply_mean_shift(X, shift):
+        return np.clip(X + shift, 0.0, None)
+
+    def fit_global_affine(raw_ref, clean_ref):
+        # Like fit_mean_shift, but also rescales by a single global std ratio --
+        # one (scale, shift) pair for the whole array, not per-channel and not
+        # per-sample. raw_ref.std() > clean_ref.std() here, so this compresses raw's
+        # spread down to clean's; unlike instance_norm it does NOT reset each row's
+        # own std -- it applies the same scale/shift everywhere.
+        raw_mean, raw_std = float(raw_ref.mean()), float(raw_ref.std())
+        clean_mean, clean_std = float(clean_ref.mean()), float(clean_ref.std())
+        scale = clean_std / raw_std
+        shift = clean_mean - raw_mean * scale
+        return scale, shift
+
+    def apply_global_affine(X, scale, shift):
+        return np.clip(X * scale + shift, 0.0, None)
+
+    def fit_instance_norm(clean_ref):
+        # Target "typical fingerprint": the average per-sample mean and average
+        # per-sample std seen in the clean set (not the flattened population std,
+        # which would also bake in *between*-sample variation we don't want here).
+        target_mean = float(clean_ref.mean(axis=1).mean())
+        target_std = float(clean_ref.std(axis=1).mean())
+        return target_mean, target_std
+
+    def apply_instance_norm(X, target_mean, target_std, std_min, std_max):
+        # Per-sample (instance) normalization: re-center and re-scale each raw row
+        # using *its own* mean/std, then map onto clean's typical mean/std. Clamping
+        # the row's std into [std_min, std_max] guards against blow-ups when a row is
+        # almost all zeros (std near 0) and against over-flattening very spiky rows.
+        row_mean = X.mean(axis=1, keepdims=True)
+        row_std = np.clip(X.std(axis=1, keepdims=True), std_min, std_max)
+        out = (X - row_mean) / row_std * target_std + target_mean
+        return np.clip(out, 0.0, None)
+
+    return (
+        apply_global_affine,
+        apply_instance_norm,
+        apply_mean_shift,
+        fit_global_affine,
+        fit_instance_norm,
+        fit_mean_shift,
+    )
+
+
+@app.cell
+def _(
+    X_train_clean,
+    X_train_raw,
+    fit_global_affine,
+    fit_instance_norm,
+    fit_mean_shift,
+):
+    mean_shift_value = fit_mean_shift(X_train_raw, X_train_clean)
+    instance_norm_target = fit_instance_norm(X_train_clean)
+    global_affine_params = fit_global_affine(X_train_raw, X_train_clean)
+    return global_affine_params, instance_norm_target, mean_shift_value
+
+
+@app.cell
+def _(global_affine_params, mean_shift_value, mo):
+    _scale, _shift = global_affine_params
+    mo.md(f"""
+    Fitted global mean shift: raw + `{mean_shift_value:.4f}` -> matches clean's overall mean
+
+    Fitted global mean+std match: raw * `{_scale:.4f}` + `{_shift:.4f}` -> matches clean's
+    overall mean and std (single scalar pair, not per-sample)
     """)
     return
 
@@ -130,125 +271,45 @@ def _(CONF2_COLUMNS, mo):
 
 
 @app.cell
-def _(X_train_clean, X_train_raw, channel_picker, plt):
-    _c = channel_picker.value
-    fig1, ax1 = plt.subplots(figsize=(6, 4))
-    bins = 60
-    ax1.hist(X_train_clean[:, _c], bins=bins, alpha=0.5, density=True, label="clean")
-    ax1.hist(X_train_raw[:, _c], bins=bins, alpha=0.5, density=True, label="raw")
-    ax1.set_xlabel("RSS value")
-    ax1.set_ylabel("density")
-    ax1.set_title(f"Channel {_c}: clean vs raw marginal distribution")
-    ax1.legend()
-    fig1
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## Candidate per-sample transforms
-
-    Each transform below is a pure function of a single raw row — nothing here looks
-    at neighboring samples or labels, so all of them are directly portable to the
-    firmware's `handle_predict` loop.
-    """)
-    return
-
-
-@app.cell
-def _(np):
-    N_QUANTILES = 200
-    _quantile_levels = np.linspace(0.0, 1.0, N_QUANTILES)
-
-    def fit_quantile_maps(raw_ref, clean_ref, n_channels):
-        maps = []
-        for c in range(n_channels):
-            raw_q = np.quantile(raw_ref[:, c], _quantile_levels)
-            clean_q = np.quantile(clean_ref[:, c], _quantile_levels)
-            maps.append((raw_q, clean_q))
-        return maps
-
-    def apply_quantile_maps(X, maps, blend):
-        out = np.empty_like(X)
-        for c, (raw_q, clean_q) in enumerate(maps):
-            mapped = np.interp(X[:, c], raw_q, clean_q)
-            out[:, c] = (1.0 - blend) * X[:, c] + blend * mapped
-        return out
-
-    def fit_affine(raw_ref, clean_ref, n_channels):
-        params = []
-        for c in range(n_channels):
-            raw_mean, raw_std = raw_ref[:, c].mean(), raw_ref[:, c].std() + 1e-8
-            clean_mean, clean_std = clean_ref[:, c].mean(), clean_ref[:, c].std()
-            params.append((raw_mean, raw_std, clean_mean, clean_std))
-        return params
-
-    def apply_affine(X, params):
-        out = np.empty_like(X)
-        for c, (raw_mean, raw_std, clean_mean, clean_std) in enumerate(params):
-            out[:, c] = (X[:, c] - raw_mean) / raw_std * clean_std + clean_mean
-        return np.clip(out, 0.0, None)
-
-    def apply_threshold_denoise(X, threshold):
-        return np.where(X < threshold, 0.0, X)
-
-    return (
-        apply_affine,
-        apply_quantile_maps,
-        apply_threshold_denoise,
-        fit_affine,
-        fit_quantile_maps,
-    )
-
-
-@app.cell
-def _(X_train_clean, X_train_raw, fit_affine, fit_quantile_maps):
-    quantile_maps = fit_quantile_maps(X_train_raw, X_train_clean, X_train_raw.shape[1])
-    affine_params = fit_affine(X_train_raw, X_train_clean, X_train_raw.shape[1])
-    return affine_params, quantile_maps
-
-
-@app.cell
 def _(mo):
     transform_picker = mo.ui.dropdown(
-        options=["identity", "clip", "threshold_denoise", "affine_match", "quantile_map"],
+        options=["identity", "mean_shift", "global_affine", "instance_norm"],
         value="identity",
         label="Transform",
     )
-    clip_multiplier = mo.ui.slider(1.0, 2.0, step=0.05, value=1.0, label="clip upper bound (× rss_scale)")
-    denoise_threshold = mo.ui.slider(0.0, 0.1, step=0.005, value=0.02, label="denoise threshold")
-    quantile_blend = mo.ui.slider(0.0, 1.0, step=0.05, value=1.0, label="quantile-map blend (0=identity, 1=full map)")
-    mo.vstack([transform_picker, clip_multiplier, denoise_threshold, quantile_blend])
-    return clip_multiplier, denoise_threshold, quantile_blend, transform_picker
+    instance_norm_std_min = mo.ui.slider(0.0, 0.15, step=0.005, value=0.05, label="instance-norm std clip: min")
+    instance_norm_std_max = mo.ui.slider(0.1, 0.4, step=0.005, value=0.25, label="instance-norm std clip: max")
+    mo.vstack([transform_picker, instance_norm_std_min, instance_norm_std_max])
+    return instance_norm_std_max, instance_norm_std_min, transform_picker
 
 
 @app.cell
 def _(
     X_test_raw,
-    affine_params,
-    apply_affine,
-    apply_quantile_maps,
-    apply_threshold_denoise,
-    clip_multiplier,
-    denoise_threshold,
-    np,
-    quantile_blend,
-    quantile_maps,
-    rss_scale,
+    apply_global_affine,
+    apply_instance_norm,
+    apply_mean_shift,
+    global_affine_params,
+    instance_norm_std_max,
+    instance_norm_std_min,
+    instance_norm_target,
+    mean_shift_value,
     transform_picker,
 ):
     def transform(X, name):
         if name == "identity":
             return X
-        if name == "clip":
-            return np.clip(X, 0.0, rss_scale * clip_multiplier.value)
-        if name == "threshold_denoise":
-            return apply_threshold_denoise(X, denoise_threshold.value)
-        if name == "affine_match":
-            return apply_affine(X, affine_params)
-        if name == "quantile_map":
-            return apply_quantile_maps(X, quantile_maps, quantile_blend.value)
+        if name == "mean_shift":
+            return apply_mean_shift(X, mean_shift_value)
+        if name == "global_affine":
+            scale, shift = global_affine_params
+            return apply_global_affine(X, scale, shift)
+        if name == "instance_norm":
+            target_mean, target_std = instance_norm_target
+            return apply_instance_norm(
+                X, target_mean, target_std,
+                instance_norm_std_min.value, instance_norm_std_max.value,
+            )
         raise ValueError(name)
 
     X_test_transformed = transform(X_test_raw, transform_picker.value)
@@ -337,81 +398,6 @@ def _(
         | int8  | {int8_errors.mean():.3f} | {np.median(int8_errors):.3f} | {np.percentile(int8_errors, 95):.3f} |
         """
     )
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## Reference table (fixed, not tied to the sliders above)
-
-    For context: the deployable candidates above against the un-deployable "grouped
-    mean" ceiling (it needs repeated raw readings tied to a known coordinate, which the
-    firmware never has at inference time — shown here only to see how much headroom
-    a per-sample transform is chasing).
-    """)
-    return
-
-
-@app.cell
-def _(
-    X_test_raw,
-    affine_params,
-    apply_affine,
-    apply_quantile_maps,
-    euclidean_errors_cm,
-    int8_tflite_bytes,
-    mo,
-    np,
-    quantile_maps,
-    rss_scale,
-    run_tflite,
-    target_min_cm,
-    target_range_cm,
-    tflite_bytes,
-    y_test_cm,
-):
-    def _norm(X):
-        return np.clip(X, 0.0, None) / rss_scale
-
-    def _grouped_mean_ceiling():
-        keys = [tuple(row) for row in np.round(y_test_cm).astype(int)]
-        groups = {}
-        for i, k in enumerate(keys):
-            groups.setdefault(k, []).append(i)
-        grouped_x = np.empty((len(groups), X_test_raw.shape[1]), dtype=np.float32)
-        grouped_y = np.empty((len(groups), 2), dtype=np.float32)
-        for g, idx in enumerate(groups.values()):
-            grouped_x[g] = X_test_raw[idx].mean(axis=0)
-            grouped_y[g] = y_test_cm[idx].mean(axis=0)
-        return grouped_x, grouped_y
-
-    _candidates = {
-        "no preprocessing": X_test_raw,
-        "quantile map (full)": apply_quantile_maps(X_test_raw, quantile_maps, 1.0),
-        "affine match": apply_affine(X_test_raw, affine_params),
-    }
-
-    _rows = []
-    for _name, _X in _candidates.items():
-        _Xn = _norm(_X)
-        _fp = run_tflite(tflite_bytes, _Xn, target_min_cm, target_range_cm, False)
-        _fe = euclidean_errors_cm(_fp, y_test_cm)
-        _ip = run_tflite(int8_tflite_bytes, _Xn, target_min_cm, target_range_cm, True)
-        _ie = euclidean_errors_cm(_ip, y_test_cm)
-        _rows.append((_name, _fe.mean(), np.median(_fe), _ie.mean(), np.median(_ie)))
-
-    _grouped_x, _grouped_y = _grouped_mean_ceiling()
-    _gxn = _norm(_grouped_x)
-    _gfp = run_tflite(tflite_bytes, _gxn, target_min_cm, target_range_cm, False)
-    _gfe = euclidean_errors_cm(_gfp, _grouped_y)
-    _rows.append(("grouped mean (not deployable)", _gfe.mean(), np.median(_gfe), float("nan"), float("nan")))
-
-    _table = "| candidate | float mean | float median | int8 mean | int8 median |\n|---|---|---|---|---|\n"
-    for _name, _fm, _fmed, _im, _imed in _rows:
-        _table += f"| {_name} | {_fm:.3f} | {_fmed:.3f} | {_im:.3f} | {_imed:.3f} |\n"
-
-    mo.md(_table)
     return
 
 
